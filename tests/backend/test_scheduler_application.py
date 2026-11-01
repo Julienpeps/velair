@@ -5782,6 +5782,128 @@ class VelairSchedulerPreconditioningTest(unittest.IsolatedAsyncioTestCase):
     async def _async_save(self) -> None:
         self.save_count += 1
 
+    def test_vtherm_preset_block_can_plan_early_without_numeric_command(self) -> None:
+        self.hass.states[self.entity_id] = SimpleNamespace(
+            state="heat",
+            attributes={
+                "current_temperature": 18, "is_ready": True,
+                "configuration": {"type": "over_climate_valve"},
+                "preset_temperatures": {"boost_temp": 21},
+                "is_presence_configured": False, "is_power_configured": False,
+                "is_window_configured": True, "is_window_auto_configured": False,
+                "window_manager": {"window_state": "off"},
+                "is_safety_configured": True, "safety_manager": {"safety_state": "off"},
+                "min_temp": 10, "max_temp": 30,
+            },
+        )
+        self.data["zones"][self.entity_id]["schedule"]["tuesday"] = [
+            {"start": "20:00", "action": "set_climate_options", "preset_mode": "boost"}
+        ]
+        event = self.scheduler.calculate_next_event(NOW)
+        self.assertEqual(event.when, datetime(2026, 5, 19, 18, 30, tzinfo=timezone.utc))
+        self.assertEqual(event.action, "set_climate_options")
+        self.assertEqual(event.preset_mode, "boost")
+        self.assertIsNone(event.temperature)
+
+    def test_vtherm_preset_does_not_plan_early_with_open_window(self) -> None:
+        self.hass.states[self.entity_id] = SimpleNamespace(
+            state="heat", attributes={
+                "current_temperature": 18, "is_ready": True,
+                "configuration": {"type": "over_climate_valve"},
+                "preset_temperatures": {"boost_temp": 21},
+                "is_presence_configured": False, "is_power_configured": False,
+                "is_window_configured": True, "is_window_auto_configured": False,
+                "window_manager": {"window_state": "on"},
+                "is_safety_configured": False, "min_temp": 10, "max_temp": 30,
+            }
+        )
+        self.data["zones"][self.entity_id]["schedule"]["tuesday"] = [
+            {"start": "20:00", "action": "set_climate_options", "preset_mode": "boost"}
+        ]
+        event = self.scheduler.calculate_next_event(NOW)
+        self.assertEqual(event.when, datetime(2026, 5, 19, 20, 0, tzinfo=timezone.utc))
+
+    async def test_vtherm_early_preset_uses_only_preset_service_and_tracks_learning(self) -> None:
+        self.hass.states[self.entity_id] = SimpleNamespace(
+            state="heat", attributes={
+                "current_temperature": 18, "is_ready": True,
+                "configuration": {"type": "over_climate_valve"},
+                "preset_temperatures": {"boost_temp": 21},
+                "is_presence_configured": False, "is_power_configured": False,
+                "is_window_configured": True, "is_window_auto_configured": False,
+                "window_manager": {"window_state": "off"},
+                "is_safety_configured": False, "min_temp": 10, "max_temp": 30,
+            }
+        )
+        self.climate.climate_options[self.entity_id] = {"preset_mode": ["boost"]}
+        self.climate.async_apply_climate_options = AsyncMock()
+        self.data["zones"][self.entity_id]["schedule"]["tuesday"] = [
+            {"start": "20:00", "action": "set_climate_options", "preset_mode": "boost"}
+        ]
+        event = self.scheduler.calculate_next_event(NOW)
+        await self.scheduler._async_apply_resolved_event_call(event, source="test")
+        await self.scheduler._async_commit_resolved_event(
+            event, hvac_mode=None, source="test", applied_at=event.when,
+            is_current=lambda: True,
+        )
+        self.climate.async_apply_climate_options.assert_awaited_once()
+        self.assertEqual(self.climate.calls, [])
+        session = self.scheduler._preconditioning_sessions[self.entity_id]
+        self.assertEqual(session.target_temperature, 21)
+        self.assertEqual(session.preset_mode, "boost")
+        self.assertTrue(self.scheduler._is_applied_preconditioning_event(event))
+        active = self.scheduler._room_sensor_assist_target_event(self.entity_id)
+        self.assertEqual(active.action, "set_climate_options")
+        self.assertEqual(active.preset_mode, "boost")
+        self.assertIsNone(active.temperature)
+
+    def test_vtherm_preset_preconditioning_replans_when_target_or_window_changes(self) -> None:
+        attrs = {
+            "current_temperature": 18, "is_ready": True,
+            "configuration": {"type": "over_climate_valve"},
+            "preset_temperatures": {"boost_temp": 21},
+            "is_presence_configured": False, "is_power_configured": False,
+            "is_window_configured": True, "is_window_auto_configured": False,
+            "window_manager": {"window_state": "off"},
+            "is_safety_configured": False, "min_temp": 10, "max_temp": 30,
+        }
+        before = SimpleNamespace(state="heat", attributes=attrs)
+        after = SimpleNamespace(state="heat", attributes={**attrs, "window_manager": {"window_state": "on"}})
+        self.hass.states[self.entity_id] = before
+        self.data["zones"][self.entity_id]["schedule"]["tuesday"] = [
+            {"start": "20:00", "action": "set_climate_options", "preset_mode": "boost"}
+        ]
+        self.scheduler._refresh_preconditioning_replan_listener()
+        self.assertIn(self.entity_id, self.scheduler._preconditioning_replan_entities)
+        self.scheduler._handle_preconditioning_replan_state_change(
+            SimpleNamespace(data={"entity_id": self.entity_id, "old_state": before, "new_state": after})
+        )
+        self.assertIsNotNone(self.scheduler._unsub_preconditioning_replan_timer)
+
+    async def test_vtherm_stale_early_event_does_not_apply_after_window_opens(self) -> None:
+        attrs = {
+            "current_temperature": 18, "is_ready": True,
+            "configuration": {"type": "over_climate_valve"},
+            "preset_temperatures": {"boost_temp": 21},
+            "is_presence_configured": False, "is_power_configured": False,
+            "is_window_configured": True, "is_window_auto_configured": False,
+            "window_manager": {"window_state": "off"},
+            "is_safety_configured": False, "min_temp": 10, "max_temp": 30,
+        }
+        self.hass.states[self.entity_id] = SimpleNamespace(state="heat", attributes=attrs)
+        self.climate.climate_options[self.entity_id] = {"preset_mode": ["boost"]}
+        self.climate.async_apply_climate_options = AsyncMock()
+        self.data["zones"][self.entity_id]["schedule"]["tuesday"] = [
+            {"start": "20:00", "action": "set_climate_options", "preset_mode": "boost"}
+        ]
+        event = self.scheduler.calculate_next_event(NOW)
+        self.hass.states[self.entity_id] = SimpleNamespace(
+            state="heat", attributes={**attrs, "window_manager": {"window_state": "on"}}
+        )
+        await self.scheduler._async_apply_event(event, source="test", applied_at=event.when)
+        self.climate.async_apply_climate_options.assert_not_awaited()
+        self.assertEqual(self.climate.calls, [])
+
     def _room_assist_hysteresis_state(
         self,
         *,

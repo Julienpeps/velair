@@ -25,6 +25,7 @@ from homeassistant.util import dt as dt_util
 
 from .climate_delivery import ClimateDeliveryCoordinator, CurrentGuard, Delivery
 from .climate_manager import ClimateManager
+from .vtherm_preset_target import vtherm_preset_target
 from .const import (
     ACTION_SET_CLIMATE_OPTIONS,
     ACTION_SET_HVAC_MODE,
@@ -237,6 +238,7 @@ class _PreconditioningSession:
     outdoor_temp_start: float | None
     target_temp_low: float | None = None
     target_temp_high: float | None = None
+    preset_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +325,7 @@ class _AppliedPreconditioningTarget:
 
     active_from: datetime
     target_when: datetime
+    preset_event: ClimateEvent | None = None
 
 
 class VelairScheduler:
@@ -4426,6 +4429,16 @@ class VelairScheduler:
             # new authoritative source block without restoring or resending it.
             await self._async_refresh_room_sensor_assist_from_current_event(entity_id)
 
+        # Apply an already-due preset preheat before registering its timer;
+        # otherwise the timer and save can send the same preset concurrently.
+        if (intent_changed and event is not None and self.mode == MODE_AUTO
+            and event.action == ACTION_SET_CLIMATE_OPTIONS and event.target_when is not None):
+            try:
+                await self.async_apply_current_schedule(entity_id, source="schedule_saved")
+            finally:
+                self.async_schedule_next_event()
+            return
+
         self.async_schedule_next_event()
 
         if not intent_changed or event is None or self.mode != MODE_AUTO:
@@ -5038,6 +5051,7 @@ class VelairScheduler:
         ] = _AppliedPreconditioningTarget(
             active_from=event.when,
             target_when=event.target_when,
+            preset_event=event if event.action == ACTION_SET_CLIMATE_OPTIONS else None,
         )
 
     def _clear_applied_preconditioning_targets(self, now: datetime) -> None:
@@ -5081,7 +5095,8 @@ class VelairScheduler:
         config = normalize_preconditioning_data(zone.get("preconditioning"))
         if not config["enabled"]:
             return target_when, None
-        if block.get("action", ACTION_SET_TEMPERATURE) != ACTION_SET_TEMPERATURE:
+        action = block.get("action", ACTION_SET_TEMPERATURE)
+        if action not in (ACTION_SET_TEMPERATURE, ACTION_SET_CLIMATE_OPTIONS):
             return target_when, None
         resolved_target = self._resolve_preconditioning_target(entity_id, config, block)
         if resolved_target is None:
@@ -5196,7 +5211,15 @@ class VelairScheduler:
                 return _ResolvedPreconditioningTarget("range", "cool", high, "high")
             return None
 
-        target_temperature = _event_temperature(block)
+        if block.get("action") == ACTION_SET_CLIMATE_OPTIONS:
+            options = _event_climate_options(block)
+            if set(options) != {ATTR_PRESET_MODE}:
+                return None
+            target_temperature = vtherm_preset_target(
+                self._hass.states.get(entity_id), options[ATTR_PRESET_MODE]
+            )
+        else:
+            target_temperature = _event_temperature(block)
         if target_temperature is None:
             return None
 
@@ -5723,6 +5746,8 @@ class VelairScheduler:
             if not delivery_is_current():
                 return
             self._async_fire_climate_target_applied(event, hvac_mode=None, source=source)
+            self._mark_preconditioning_applied(event)
+            self._start_preconditioning_session(event, hvac_mode, applied_at or dt_util.now())
             return
 
         is_range = (
@@ -5783,6 +5808,8 @@ class VelairScheduler:
             "action": event.action,
             **_event_target_mapping(event),
         }
+        if event.preset_mode is not None:
+            block[ATTR_PRESET_MODE] = event.preset_mode
         if event.hvac_mode is not None:
             block["hvac_mode"] = event.hvac_mode
         resolved_target = self._resolve_preconditioning_target(
@@ -5814,6 +5841,7 @@ class VelairScheduler:
             start_temperature=start_temperature,
             hvac_mode=hvac_mode or event.hvac_mode,
             startup_minutes=startup_minutes,
+            preset_mode=event.preset_mode if event.action == ACTION_SET_CLIMATE_OPTIONS else None,
             outdoor_temp_start=self._outdoor_temperature(
                 event.entity_id,
                 config,
@@ -5890,6 +5918,7 @@ class VelairScheduler:
 
         source_entity_ids = sorted(
             {self._temperature_source_entity_id(entity_id) for entity_id in entity_ids}
+            | set(entity_ids)
         )
         self._unsub_preconditioning_replan_listener = async_track_state_change_event(
             self._hass,
@@ -5932,11 +5961,16 @@ class VelairScheduler:
             event_date = today + timedelta(days=day_offset)
             weekday = WEEKDAYS[event_date.weekday()]
             for block in schedule[weekday]:
-                if block.get("action", ACTION_SET_TEMPERATURE) != ACTION_SET_TEMPERATURE:
-                    continue
-                if not any(
-                    key in block
-                    for key in ("temperature", ATTR_TARGET_TEMP_LOW, ATTR_TARGET_TEMP_HIGH)
+                action = block.get("action", ACTION_SET_TEMPERATURE)
+                is_preset = (
+                    action == ACTION_SET_CLIMATE_OPTIONS
+                    and set(_event_climate_options(block)) == {ATTR_PRESET_MODE}
+                )
+                if not is_preset and (
+                    action != ACTION_SET_TEMPERATURE or not any(
+                        key in block for key in
+                        ("temperature", ATTR_TARGET_TEMP_LOW, ATTR_TARGET_TEMP_HIGH)
+                    )
                 ):
                     continue
                 event_time = _parse_start_time(block["start"])
@@ -5961,6 +5995,15 @@ class VelairScheduler:
 
         changed = False
         for entity_id in self._preconditioning_replan_entities:
+            old_state = event.data.get("old_state")
+            if source_entity_id == entity_id and _vtherm_planning_signature(old_state) != _vtherm_planning_signature(new_state):
+                # A preset value, mode or safety state can change the future
+                # target even when the measured temperature stays constant.
+                changed = True
+                session = self._preconditioning_sessions.get(entity_id)
+                if session is not None and session.preset_mode is not None:
+                    # Do not learn a cycle whose target or safety context moved.
+                    self._discard_preconditioning_session(entity_id)
             temperature = self._temperature_from_source_state(
                 entity_id,
                 source_entity_id,
@@ -6421,6 +6464,20 @@ class VelairScheduler:
     def _room_sensor_assist_target_event(self, entity_id: str) -> ClimateEvent | None:
         """Return the current target Room Sensor Assist should follow."""
         now = dt_util.now()
+        for marker in self._applied_preconditioning_targets.values():
+            event = marker.preset_event
+            if event is None or event.entity_id != entity_id or marker.target_when <= now:
+                continue
+            zone = self._data["zones"].get(entity_id)
+            schedule = self._effective_schedule(entity_id, zone) if zone is not None else None
+            if schedule is None:
+                continue
+            for block in schedule.get(event.weekday, []):
+                if (block.get("start") == event.start
+                    and block.get("action") == ACTION_SET_CLIMATE_OPTIONS
+                    and block.get(ATTR_PRESET_MODE) == event.preset_mode
+                    and set(_event_climate_options(block)) == {ATTR_PRESET_MODE}):
+                    return event
         session = self._preconditioning_sessions.get(entity_id)
         if session is not None and session.target_when > now:
             if not self._room_sensor_assist_scheduled_target_exists(
@@ -11299,6 +11356,27 @@ def _room_sensor_assist_nearest_step_temperature(
     return minimum + math.floor(
         ((temperature - minimum) / step) + 0.5 + 0.000000001
     ) * step
+
+
+def _vtherm_planning_signature(state) -> tuple | None:
+    """Return VTherm fields that change whether preset preconditioning is safe."""
+    if state is None:
+        return None
+    attrs = getattr(state, "attributes", {})
+    if not isinstance(attrs.get("preset_temperatures"), dict):
+        return None
+    window = attrs.get("window_manager")
+    safety = attrs.get("safety_manager")
+    window = window if isinstance(window, dict) else {}
+    safety = safety if isinstance(safety, dict) else {}
+    return (
+        getattr(state, "state", None), attrs.get("is_ready"),
+        attrs.get("is_presence_configured"), attrs.get("is_power_configured"),
+        attrs.get("is_window_configured"), attrs.get("is_window_auto_configured"),
+        window.get("window_state"), attrs.get("is_safety_configured"),
+        safety.get("safety_state"),
+        tuple(sorted(attrs["preset_temperatures"].items())),
+    )
 
 
 def _state_temperature(state) -> float | None:
